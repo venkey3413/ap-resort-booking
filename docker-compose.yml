@@ -18,8 +18,10 @@ services:
       - REDIS_URL=redis://redis:6379
       - DB_API_URL=http://centralized-db-api:3003
       - BOOKING_API_URL=http://booking-service:3002
-      - EMAIL_USER=vizagresortbooking@gmail.com
-      - EMAIL_PASS=pcvclorjnrxdlnku
+      - EMAIL_USER=${EMAIL_USER}
+      - EMAIL_PASS=${EMAIL_PASS}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - CLOUDINARY_CLOUD_NAME=${CLOUDINARY_CLOUD_NAME}
       - CLOUDINARY_API_KEY=${CLOUDINARY_API_KEY}
       - CLOUDINARY_API_SECRET=${CLOUDINARY_API_SECRET}
@@ -53,8 +55,10 @@ services:
       - NODE_ENV=development
       - REDIS_URL=redis://redis:6379
       - DB_API_URL=http://centralized-db-api:3003
-      - EMAIL_USER=vizagresortbooking@gmail.com
-      - EMAIL_PASS=pcvclorjnrxdlnku
+      - EMAIL_USER=${EMAIL_USER}
+      - EMAIL_PASS=${EMAIL_PASS}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
     depends_on:
       - redis
       - centralized-db-api
