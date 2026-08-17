@@ -2,11 +2,14 @@ const nodemailer = require('nodemailer');
 require('dotenv').config();
 
 // Create transporter
+if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    console.warn('⚠️ EMAIL_USER or EMAIL_PASS is not set — emails will fail to send. Check your .env file.');
+}
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
         user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_APP_PASSWORD
+        pass: process.env.EMAIL_PASS
     }
 });
 
