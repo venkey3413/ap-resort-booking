@@ -1,28 +1,12 @@
-// Jenkinsfile — Vizag Resort Booking (vshakago.in)
-// Builds each microservice image, pushes to a registry, then deploys to the
-// EC2 host over SSH using the same docker-compose flow described in DEPLOY_WINSTON.md.
+// ============================================================================
+// Jenkinsfile - VshakaGo / Vizag Resort Booking
+// Same-EC2 CI/CD with local Docker images and automatic rollback.
 //
-// -------------------------------------------------------------------------
-// ONE-TIME JENKINS SETUP (do this before the first run)
-// -------------------------------------------------------------------------
-// 1) Credentials (Manage Jenkins > Credentials):
-//      - "ec2-ssh-key"        : SSH Username with private key, user = ubuntu,
-//                               private key = your EC2 .pem key
-//      - "docker-registry"    : Username/password (or token) for your image
-//                               registry (Docker Hub, ECR, GHCR, etc.)
-//      - "app-env-file"       : Secret file credential containing your
-//                               production .env (copied to the server as .env)
-//    Optional (only needed if you want Telegram build notifications, since
-//    the app already uses Telegram elsewhere):
-//      - "telegram-bot-token" : Secret text
-//      - "telegram-chat-id"   : Secret text
+// GitHub -> Jenkins -> validation -> Docker build -> deploy -> health check
+//                                             |-> failure -> previous release
 //
-// 2) Jenkins node/agent needs: git, docker, docker-compose (or docker compose
-//    plugin), and network access to your registry.
-//
-// 3) Update the values in the `environment` block below (registry, EC2 host,
-//    remote deploy path) to match your actual setup.
-// -------------------------------------------------------------------------
+// No Docker Hub/ECR/GHCR and no SSH are required.
+// ============================================================================
 
 pipeline {
     agent any
@@ -32,27 +16,38 @@ pipeline {
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '20'))
         ansiColor('xterm')
+        timeout(time: 30, unit: 'MINUTES')
     }
 
     parameters {
-        booleanParam(name: 'PUSH_IMAGES', defaultValue: true, description: 'Build and push Docker images to the registry')
-        booleanParam(name: 'DEPLOY', defaultValue: true, description: 'Deploy to the EC2 server after a successful build')
-        string(name: 'IMAGE_TAG', defaultValue: '', description: 'Override image tag (defaults to git short SHA)')
+        booleanParam(
+            name: 'DEPLOY',
+            defaultValue: true,
+            description: 'Deploy after a successful Docker build'
+        )
+        booleanParam(
+            name: 'RUN_HEALTH_CHECK',
+            defaultValue: true,
+            description: 'Run health checks after deployment'
+        )
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: '',
+            description: 'Optional Docker image tag. Leave blank to use the 7-character Git SHA.'
+        )
     }
 
     environment {
-        // ---- Registry & image naming ---------------------------------------
-        REGISTRY        = 'docker.io/your-dockerhub-user'   // e.g. 'docker.io/venkey' or an ECR URL
-        REGISTRY_CREDS  = 'docker-registry'                 // Jenkins credentials ID
-        IMAGE_TAG       = "${params.IMAGE_TAG ?: env.GIT_COMMIT?.take(7) ?: 'latest'}"
+        APP_DIR = '/home/ubuntu/vizag-resort-booking'
+        COMPOSE_FILE = 'docker-compose.yml'
+        ENV_CREDENTIAL_ID = 'app-env-file'
+        STATE_DIR = '/var/lib/jenkins/vshakago-deploy'
 
-        // ---- Deploy target ---------------------------------------------------
-        EC2_HOST         = 'ubuntu@35.154.92.5'             // matches DEPLOY_WINSTON.md
-        EC2_SSH_CRED      = 'ec2-ssh-key'
-        REMOTE_APP_DIR    = '/home/ubuntu/vizag-resort-booking'
-
-        // ---- Services (Dockerfile name -> compose service name) --------------
-        SERVICES = 'main:Dockerfile.main,admin:Dockerfile.admin,booking:Dockerfile.booking,websocket:Dockerfile.websocket,centralized-db:Dockerfile.centralized-db'
+        MAIN_IMAGE = 'vshakago/main-service'
+        ADMIN_IMAGE = 'vshakago/admin-service'
+        BOOKING_IMAGE = 'vshakago/booking-service'
+        DB_IMAGE = 'vshakago/centralized-db-api'
+        WS_IMAGE = 'vshakago/websocket-service'
     }
 
     stages {
@@ -60,30 +55,46 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout scm
+
                 script {
-                    env.GIT_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-                    if (!params.IMAGE_TAG?.trim()) {
-                        env.IMAGE_TAG = env.GIT_SHORT
-                    }
+                    env.GIT_SHORT = sh(
+                        script: 'git rev-parse --short=7 HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.DEPLOY_TAG = params.IMAGE_TAG?.trim()
+                        ? params.IMAGE_TAG.trim()
+                        : env.GIT_SHORT
                 }
-                echo "Building commit ${env.GIT_SHORT} as tag ${env.IMAGE_TAG}"
+
+                echo "Commit: ${env.GIT_SHORT}"
+                echo "Image tag: ${env.DEPLOY_TAG}"
             }
         }
 
-        stage('Install Dependencies') {
+        stage('Environment Check') {
             steps {
                 sh '''
+                    set -e
                     node --version
-                    npm ci --no-audit --no-fund
+                    npm --version
+                    docker --version
+                    docker compose version
+                    git --version
+                    echo ""
+                    df -h /
+                    echo ""
+                    free -h
+                    echo ""
+                    docker system df
                 '''
             }
         }
 
-        stage('Lint / Sanity Check') {
+        stage('Node Syntax Check') {
             steps {
-                // No lint script is currently defined in package.json.
-                // This just fails fast on syntax errors before we build images.
                 sh '''
+                    set -e
                     node --check server.js
                     node --check admin-server.js
                     node --check booking-server.js
@@ -93,80 +104,229 @@ pipeline {
             }
         }
 
-        stage('Build Docker Images') {
+        stage('Validate Compose') {
             steps {
-                script {
-                    def services = env.SERVICES.split(',').collectEntries {
-                        def (name, dockerfile) = it.split(':')
-                        [(name): dockerfile]
-                    }
-                    services.each { name, dockerfile ->
-                        sh """
-                            docker build -f ${dockerfile} -t ${REGISTRY}/vizag-${name}:${IMAGE_TAG} -t ${REGISTRY}/vizag-${name}:latest .
-                        """
-                    }
+                withCredentials([
+                    file(credentialsId: "${ENV_CREDENTIAL_ID}", variable: 'PRODUCTION_ENV')
+                ]) {
+                    sh '''
+                        set -e
+                        docker compose \
+                          --env-file "$PRODUCTION_ENV" \
+                          -f "$COMPOSE_FILE" \
+                          config -q
+                        echo "Compose validation passed."
+                    '''
                 }
             }
         }
 
-        stage('Push Docker Images') {
-            when { expression { params.PUSH_IMAGES } }
+        stage('Prepare Rollback State') {
+            when {
+                expression { return params.DEPLOY }
+            }
             steps {
                 script {
-                    def services = env.SERVICES.split(',').collect { it.split(':')[0] }
-                    docker.withRegistry("https://${REGISTRY.split('/')[0]}", REGISTRY_CREDS) {
-                        services.each { name ->
-                            sh """
-                                docker push ${REGISTRY}/vizag-${name}:${IMAGE_TAG}
-                                docker push ${REGISTRY}/vizag-${name}:latest
-                            """
+                    sh '''
+                        set -e
+                        mkdir -p "$STATE_DIR"
+                    '''
+
+                    def currentFile = "${env.STATE_DIR}/current_tag"
+                    def currentTag = sh(
+                        script: "test -f '${currentFile}' && cat '${currentFile}' || true",
+                        returnStdout: true
+                    ).trim()
+
+                    // The first deployment needs to preserve the images that
+                    // are already running under the old Compose configuration.
+                    if (!currentTag) {
+                        currentTag = "legacy-${env.BUILD_NUMBER}"
+
+                        def services = [
+                            'main-service': env.MAIN_IMAGE,
+                            'admin-service': env.ADMIN_IMAGE,
+                            'booking-service': env.BOOKING_IMAGE,
+                            'centralized-db-api': env.DB_IMAGE,
+                            'websocket-service': env.WS_IMAGE
+                        ]
+
+                        services.each { service, imageName ->
+                            def containerId = sh(
+                                script: "docker ps -q --filter label=com.docker.compose.service=${service} | head -1",
+                                returnStdout: true
+                            ).trim()
+
+                            if (!containerId) {
+                                containerId = sh(
+                                    script: "docker ps -q --filter name=${service} | head -1",
+                                    returnStdout: true
+                                ).trim()
+                            }
+
+                            if (!containerId) {
+                                error("No running container found for ${service}. Do not deploy until the existing production containers are running.")
+                            }
+
+                            def imageId = sh(
+                                script: "docker inspect -f '{{.Image}}' ${containerId}",
+                                returnStdout: true
+                            ).trim()
+
+                            sh "docker tag ${imageId} ${imageName}:${currentTag}"
+                            echo "Preserved ${service} as ${imageName}:${currentTag}"
                         }
+
+                        sh "printf '%s\\n' '${currentTag}' > '${currentFile}'"
                     }
+
+                    env.ROLLBACK_TAG = currentTag
+                    echo "Rollback target: ${env.ROLLBACK_TAG}"
                 }
             }
         }
 
-        stage('Deploy to EC2') {
-            when { expression { params.DEPLOY } }
+        stage('Docker Build') {
             steps {
-                sshagent(credentials: [EC2_SSH_CRED]) {
-                    // Push the current production env file to the server so
-                    // docker-compose has the secrets it needs (kept out of git).
-                    withCredentials([file(credentialsId: 'app-env-file', variable: 'ENV_FILE')]) {
-                        sh """
-                            scp -o StrictHostKeyChecking=no "\$ENV_FILE" ${EC2_HOST}:${REMOTE_APP_DIR}/.env
-                        """
-                    }
-                    sh """
-                        ssh -o StrictHostKeyChecking=no ${EC2_HOST} '
-                            set -e
-                            cd ${REMOTE_APP_DIR}
-                            git fetch origin
-                            git reset --hard origin/main
-                            docker-compose pull || true
-                            docker-compose build --no-cache
-                            docker-compose down
-                            docker-compose up -d
-                            docker image prune -f
-                        '
-                    """
+                withCredentials([
+                    file(credentialsId: "${ENV_CREDENTIAL_ID}", variable: 'PRODUCTION_ENV')
+                ]) {
+                    sh '''
+                        set -e
+
+                        echo "Building local Docker images with tag: $DEPLOY_TAG"
+
+                        IMAGE_TAG="$DEPLOY_TAG" \
+                        docker compose \
+                          --env-file "$PRODUCTION_ENV" \
+                          -f "$COMPOSE_FILE" \
+                          build
+
+                        echo ""
+                        echo "Built VshakaGo images:"
+                        docker images --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}' | \
+                          grep '^vshakago/' || true
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy') {
+            when {
+                expression { return params.DEPLOY }
+            }
+            steps {
+                script {
+                    env.DEPLOY_STARTED = 'true'
+                }
+
+                withCredentials([
+                    file(credentialsId: "${ENV_CREDENTIAL_ID}", variable: 'PRODUCTION_ENV')
+                ]) {
+                    sh '''
+                        set -e
+
+                        echo "Deploying local image tag: $DEPLOY_TAG"
+
+                        IMAGE_TAG="$DEPLOY_TAG" \
+                        docker compose \
+                          --env-file "$PRODUCTION_ENV" \
+                          -f "$COMPOSE_FILE" \
+                          up -d --no-build --remove-orphans
+
+                        docker compose \
+                          --env-file "$PRODUCTION_ENV" \
+                          -f "$COMPOSE_FILE" \
+                          ps
+                    '''
                 }
             }
         }
 
         stage('Health Check') {
-            when { expression { params.DEPLOY } }
+            when {
+                allOf {
+                    expression { return params.DEPLOY }
+                    expression { return params.RUN_HEALTH_CHECK }
+                }
+            }
             steps {
-                sshagent(credentials: [EC2_SSH_CRED]) {
-                    sh """
-                        ssh -o StrictHostKeyChecking=no ${EC2_HOST} '
-                            sleep 10
-                            curl -f http://localhost:3001/health
-                            curl -f http://localhost:3002/health
-                            curl -f http://localhost:3003/health
-                            curl -f http://localhost:3000/ -o /dev/null -s -w "main-service: %{http_code}\\n"
-                        '
-                    """
+                sh '''
+                    set -e
+
+                    check_http() {
+                        URL="$1"
+                        NAME="$2"
+
+                        echo "Checking $NAME ..."
+
+                        for i in $(seq 1 30); do
+                            if curl --fail --silent --show-error --max-time 5 "$URL" > /dev/null; then
+                                echo "$NAME: OK"
+                                return 0
+                            fi
+                            echo "$NAME not ready yet ($i/30)"
+                            sleep 2
+                        done
+
+                        echo "$NAME: FAILED"
+                        return 1
+                    }
+
+                    check_http "http://127.0.0.1:3000/" "Main service"
+                    check_http "http://127.0.0.1:3001/health" "Admin service"
+                    check_http "http://127.0.0.1:3002/health" "Booking service"
+                    check_http "http://127.0.0.1:3003/health" "Centralized DB service"
+
+                    WS_ID=$(docker ps -q --filter label=com.docker.compose.service=websocket-service | head -1)
+                    test -n "$WS_ID"
+                    test "$(docker inspect -f '{{.State.Running}}' "$WS_ID")" = "true"
+
+                    echo ""
+                    echo "ALL HEALTH CHECKS PASSED."
+                '''
+            }
+        }
+
+        stage('Commit Deployment State') {
+            when {
+                expression { return params.DEPLOY }
+            }
+            steps {
+                script {
+                    def currentFile = "${env.STATE_DIR}/current_tag"
+                    def previousFile = "${env.STATE_DIR}/previous_tag"
+
+                    def oldCurrent = sh(
+                        script: "test -f '${currentFile}' && cat '${currentFile}' || true",
+                        returnStdout: true
+                    ).trim()
+
+                    def oldPrevious = sh(
+                        script: "test -f '${previousFile}' && cat '${previousFile}' || true",
+                        returnStdout: true
+                    ).trim()
+
+                    sh "printf '%s\\n' '${env.DEPLOY_TAG}' > '${currentFile}'"
+                    sh "printf '%s\\n' '${oldCurrent}' > '${previousFile}'"
+
+                    // Keep exactly one previous release for rollback.
+                    if (oldPrevious && oldPrevious != oldCurrent && oldPrevious != env.DEPLOY_TAG) {
+                        sh """
+                            docker image rm -f \\
+                              ${env.MAIN_IMAGE}:${oldPrevious} \\
+                              ${env.ADMIN_IMAGE}:${oldPrevious} \\
+                              ${env.BOOKING_IMAGE}:${oldPrevious} \\
+                              ${env.DB_IMAGE}:${oldPrevious} \\
+                              ${env.WS_IMAGE}:${oldPrevious} \\
+                              || true
+                        """
+                    }
+
+                    sh '''
+                        docker image prune -f || true
+                        docker builder prune -f --filter 'until=24h' || true
+                    '''
                 }
             }
         }
@@ -174,35 +334,122 @@ pipeline {
 
     post {
         success {
-            echo "Build ${env.BUILD_NUMBER} (${env.IMAGE_TAG}) succeeded."
-            script { notifyTelegram("✅ vshakago.in deploy succeeded — build #${env.BUILD_NUMBER}, commit ${env.GIT_SHORT}") }
+            echo "VshakaGo deployment succeeded: ${env.DEPLOY_TAG}"
+            script {
+                notifyTelegram(
+                    "✅ VshakaGo deployment SUCCESS\n" +
+                    "Build: #${env.BUILD_NUMBER}\n" +
+                    "Commit: ${env.GIT_SHORT}\n" +
+                    "Tag: ${env.DEPLOY_TAG}"
+                )
+            }
         }
+
         failure {
-            echo "Build ${env.BUILD_NUMBER} failed."
-            script { notifyTelegram("❌ vshakago.in deploy FAILED — build #${env.BUILD_NUMBER}, commit ${env.GIT_SHORT}. Check Jenkins logs.") }
+            script {
+                if (env.DEPLOY_STARTED == 'true' && env.ROLLBACK_TAG?.trim()) {
+                    echo "Deployment failed. Rolling back to ${env.ROLLBACK_TAG}"
+
+                    try {
+                        rollbackDeployment()
+
+                        notifyTelegram(
+                            "❌ VshakaGo deployment FAILED\n" +
+                            "Build: #${env.BUILD_NUMBER}\n" +
+                            "Automatic rollback completed to ${env.ROLLBACK_TAG}."
+                        )
+                    } catch (rollbackError) {
+                        echo "ROLLBACK FAILED: ${rollbackError}"
+
+                        notifyTelegram(
+                            "🚨 VshakaGo deployment FAILED\n" +
+                            "Build: #${env.BUILD_NUMBER}\n" +
+                            "Automatic rollback ALSO FAILED. Immediate investigation required."
+                        )
+                    }
+                } else {
+                    echo 'Build/validation failed before deployment. Existing production containers were not intentionally changed.'
+
+                    notifyTelegram(
+                        "❌ VshakaGo build/validation FAILED\n" +
+                        "Build: #${env.BUILD_NUMBER}\n" +
+                        "Production deployment was not started."
+                    )
+                }
+            }
         }
+
         always {
             sh 'docker image prune -f || true'
-            cleanWs()
+            cleanWs(deleteDirs: true, disableDeferredWipeout: true)
         }
     }
 }
 
-// Optional Telegram notification, reusing the same bot pattern as telegram-service.js.
-// No-ops silently if the credentials aren't configured.
+
+def rollbackDeployment() {
+    withCredentials([
+        file(credentialsId: "${env.ENV_CREDENTIAL_ID}", variable: 'PRODUCTION_ENV')
+    ]) {
+        sh '''
+            set -e
+
+            echo "Restoring previous Docker image tag: $ROLLBACK_TAG"
+
+            IMAGE_TAG="$ROLLBACK_TAG" \
+            docker compose \
+              --env-file "$PRODUCTION_ENV" \
+              -f "$COMPOSE_FILE" \
+              up -d --no-build --remove-orphans
+
+            echo "Waiting for rollback services..."
+            sleep 10
+
+            check_http() {
+                URL="$1"
+                for i in $(seq 1 20); do
+                    if curl --fail --silent --show-error --max-time 5 "$URL" > /dev/null; then
+                        return 0
+                    fi
+                    sleep 2
+                done
+                return 1
+            }
+
+            check_http "http://127.0.0.1:3000/"
+            check_http "http://127.0.0.1:3001/health"
+            check_http "http://127.0.0.1:3002/health"
+            check_http "http://127.0.0.1:3003/health"
+
+            WS_ID=$(docker ps -q --filter label=com.docker.compose.service=websocket-service | head -1)
+            test -n "$WS_ID"
+            test "$(docker inspect -f '{{.State.Running}}' "$WS_ID")" = "true"
+
+            echo "Rollback health checks passed."
+        '''
+    }
+}
+
+
 def notifyTelegram(String message) {
     try {
         withCredentials([
             string(credentialsId: 'telegram-bot-token', variable: 'TG_TOKEN'),
             string(credentialsId: 'telegram-chat-id', variable: 'TG_CHAT')
         ]) {
-            sh """
-                curl -s -X POST "https://api.telegram.org/bot\$TG_TOKEN/sendMessage" \
-                    -d chat_id=\$TG_CHAT \
-                    -d text="${message}" > /dev/null
-            """
+            withEnv(["TG_MESSAGE=${message}"]) {
+                sh '''
+                    set +x
+                    curl --fail --silent --show-error --max-time 10 \
+                      -X POST \
+                      "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+                      --data-urlencode "chat_id=${TG_CHAT}" \
+                      --data-urlencode "text=${TG_MESSAGE}" \
+                      > /dev/null
+                '''
+            }
         }
     } catch (err) {
-        echo "Telegram notification skipped (credentials not configured)."
+        echo 'Telegram notification skipped; credentials are not configured.'
     }
 }
