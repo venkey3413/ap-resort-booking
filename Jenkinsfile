@@ -40,7 +40,9 @@ pipeline {
     environment {
         APP_DIR = '/home/ubuntu/vizag-resort-booking'
         COMPOSE_FILE = 'docker-compose.yml'
-        ENV_CREDENTIAL_ID = 'app-env-file'
+        ENV_FILE = '/home/ubuntu/vizag-resort-booking/.env'
+        APP_DATA_DIR = '/home/ubuntu/vizag-resort-booking'
+        COMPOSE_PROJECT_NAME = 'vizag-resort-booking'
         STATE_DIR = '/var/lib/jenkins/vshakago-deploy'
 
         MAIN_IMAGE = 'vshakago/main-service'
@@ -106,18 +108,15 @@ pipeline {
 
         stage('Validate Compose') {
             steps {
-                withCredentials([
-                    file(credentialsId: "${ENV_CREDENTIAL_ID}", variable: 'PRODUCTION_ENV')
-                ]) {
-                    sh '''
-                        set -e
-                        docker compose \
-                          --env-file "$PRODUCTION_ENV" \
-                          -f "$COMPOSE_FILE" \
-                          config -q
-                        echo "Compose validation passed."
-                    '''
-                }
+                sh '''
+                    set -e
+                    test -r "$ENV_FILE"
+                    COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" APP_DATA_DIR="$APP_DATA_DIR" docker compose \
+                      --env-file "$ENV_FILE" \
+                      -f "$COMPOSE_FILE" \
+                      config -q
+                    echo "Compose validation passed."
+                '''
             }
         }
 
@@ -188,26 +187,20 @@ pipeline {
 
         stage('Docker Build') {
             steps {
-                withCredentials([
-                    file(credentialsId: "${ENV_CREDENTIAL_ID}", variable: 'PRODUCTION_ENV')
-                ]) {
-                    sh '''
-                        set -e
-
-                        echo "Building local Docker images with tag: $DEPLOY_TAG"
-
-                        IMAGE_TAG="$DEPLOY_TAG" \
-                        docker compose \
-                          --env-file "$PRODUCTION_ENV" \
-                          -f "$COMPOSE_FILE" \
-                          build
-
-                        echo ""
-                        echo "Built VshakaGo images:"
-                        docker images --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}' | \
-                          grep '^vshakago/' || true
-                    '''
-                }
+                sh '''
+                    set -e
+                    test -r "$ENV_FILE"
+                    echo "Building local Docker images with tag: $DEPLOY_TAG"
+                    IMAGE_TAG="$DEPLOY_TAG" \
+                    COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" APP_DATA_DIR="$APP_DATA_DIR" docker compose \
+                      --env-file "$ENV_FILE" \
+                      -f "$COMPOSE_FILE" \
+                      build
+                    echo ""
+                    echo "Built VshakaGo images:"
+                    docker images --format 'table {{.Repository}}:{{.Tag}}	{{.Size}}' | \
+                      grep '^vshakago/' || true
+                '''
             }
         }
 
@@ -220,26 +213,20 @@ pipeline {
                     env.DEPLOY_STARTED = 'true'
                 }
 
-                withCredentials([
-                    file(credentialsId: "${ENV_CREDENTIAL_ID}", variable: 'PRODUCTION_ENV')
-                ]) {
-                    sh '''
-                        set -e
-
-                        echo "Deploying local image tag: $DEPLOY_TAG"
-
-                        IMAGE_TAG="$DEPLOY_TAG" \
-                        docker compose \
-                          --env-file "$PRODUCTION_ENV" \
-                          -f "$COMPOSE_FILE" \
-                          up -d --no-build --remove-orphans
-
-                        docker compose \
-                          --env-file "$PRODUCTION_ENV" \
-                          -f "$COMPOSE_FILE" \
-                          ps
-                    '''
-                }
+                sh '''
+                    set -e
+                    test -r "$ENV_FILE"
+                    echo "Deploying local image tag: $DEPLOY_TAG"
+                    IMAGE_TAG="$DEPLOY_TAG" \
+                    COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" APP_DATA_DIR="$APP_DATA_DIR" docker compose \
+                      --env-file "$ENV_FILE" \
+                      -f "$COMPOSE_FILE" \
+                      up -d --no-build --remove-orphans
+                    COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" APP_DATA_DIR="$APP_DATA_DIR" docker compose \
+                      --env-file "$ENV_FILE" \
+                      -f "$COMPOSE_FILE" \
+                      ps
+                '''
             }
         }
 
@@ -388,46 +375,36 @@ pipeline {
 
 
 def rollbackDeployment() {
-    withCredentials([
-        file(credentialsId: "${env.ENV_CREDENTIAL_ID}", variable: 'PRODUCTION_ENV')
-    ]) {
-        sh '''
-            set -e
-
-            echo "Restoring previous Docker image tag: $ROLLBACK_TAG"
-
-            IMAGE_TAG="$ROLLBACK_TAG" \
-            docker compose \
-              --env-file "$PRODUCTION_ENV" \
-              -f "$COMPOSE_FILE" \
-              up -d --no-build --remove-orphans
-
-            echo "Waiting for rollback services..."
-            sleep 10
-
-            check_http() {
-                URL="$1"
-                for i in $(seq 1 20); do
-                    if curl --fail --silent --show-error --max-time 5 "$URL" > /dev/null; then
-                        return 0
-                    fi
-                    sleep 2
-                done
-                return 1
-            }
-
-            check_http "http://127.0.0.1:3000/"
-            check_http "http://127.0.0.1:3001/health"
-            check_http "http://127.0.0.1:3002/health"
-            check_http "http://127.0.0.1:3003/health"
-
-            WS_ID=$(docker ps -q --filter label=com.docker.compose.service=websocket-service | head -1)
-            test -n "$WS_ID"
-            test "$(docker inspect -f '{{.State.Running}}' "$WS_ID")" = "true"
-
-            echo "Rollback health checks passed."
-        '''
-    }
+    sh '''
+        set -e
+        test -r "$ENV_FILE"
+        echo "Restoring previous Docker image tag: $ROLLBACK_TAG"
+        IMAGE_TAG="$ROLLBACK_TAG" \
+        COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" APP_DATA_DIR="$APP_DATA_DIR" docker compose \
+          --env-file "$ENV_FILE" \
+          -f "$COMPOSE_FILE" \
+          up -d --no-build --remove-orphans
+        echo "Waiting for rollback services..."
+        sleep 10
+        check_http() {
+            URL="$1"
+            for i in $(seq 1 20); do
+                if curl --fail --silent --show-error --max-time 5 "$URL" > /dev/null; then
+                    return 0
+                fi
+                sleep 2
+            done
+            return 1
+        }
+        check_http "http://127.0.0.1:3000/"
+        check_http "http://127.0.0.1:3001/health"
+        check_http "http://127.0.0.1:3002/health"
+        check_http "http://127.0.0.1:3003/health"
+        WS_ID=$(docker ps -q --filter label=com.docker.compose.service=websocket-service | head -1)
+        test -n "$WS_ID"
+        test "$(docker inspect -f '{{.State.Running}}' "$WS_ID")" = "true"
+        echo "Rollback health checks passed."
+    '''
 }
 
 
