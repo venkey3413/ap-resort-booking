@@ -84,7 +84,7 @@ services:
       - CLOUDINARY_API_KEY=${CLOUDINARY_API_KEY}
       - CLOUDINARY_API_SECRET=${CLOUDINARY_API_SECRET}
     volumes:
-      - ./resort_booking.db:/app/resort_booking.db
+      - ${APP_DATA_DIR:-.}/resort_booking.db:/app/resort_booking.db
     depends_on:
       - redis
     restart: unless-stopped
