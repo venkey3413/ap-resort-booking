@@ -6,8 +6,10 @@ services:
     command: redis-server --appendonly yes
     volumes:
       - redis-data:/data
+    restart: unless-stopped
 
   main-service:
+    image: vshakago/main-service:${IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: Dockerfile.main
@@ -28,8 +30,10 @@ services:
     depends_on:
       - redis
       - centralized-db-api
+    restart: unless-stopped
 
   admin-service:
+    image: vshakago/admin-service:${IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: Dockerfile.admin
@@ -44,8 +48,10 @@ services:
     depends_on:
       - redis
       - centralized-db-api
+    restart: unless-stopped
 
   booking-service:
+    image: vshakago/booking-service:${IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: Dockerfile.booking
@@ -62,8 +68,10 @@ services:
     depends_on:
       - redis
       - centralized-db-api
+    restart: unless-stopped
 
   centralized-db-api:
+    image: vshakago/centralized-db-api:${IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: Dockerfile.centralized-db
@@ -79,8 +87,10 @@ services:
       - ./resort_booking.db:/app/resort_booking.db
     depends_on:
       - redis
+    restart: unless-stopped
 
   websocket-service:
+    image: vshakago/websocket-service:${IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: Dockerfile.websocket
@@ -94,8 +104,6 @@ services:
     depends_on:
       - redis
     restart: unless-stopped
-
-
 
 volumes:
   redis-data:
